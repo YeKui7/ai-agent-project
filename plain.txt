@@ -1,5 +1,0 @@
-git init
-git add .
-git commit -m "Initial commit: AI Agent project"
-git remote add origin https://github.com/YeKui7/ai-agent-project .git
-git push -u origin main
