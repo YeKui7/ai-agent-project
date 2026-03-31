@@ -1,31 +1,36 @@
+import os
+from datetime import datetime
+from dotenv import load_dotenv
 from langchain_deepseek import ChatDeepSeek
 from langchain.agents import create_agent
 from langchain_community.tools import TavilySearchResults
 from langchain.tools import tool
 from langchain_core.messages import HumanMessage
-from dotenv import load_dotenv
-import os
-from datetime import datetime
-import re
+from langgraph.checkpoint.memory import MemorySaver
 
+# ========== 1. 加载环境变量 ==========
 load_dotenv()
 
-# ========== 1. 初始化模型 ==========
+# ========== 2. 初始化模型 ==========
 llm = ChatDeepSeek(
     model="deepseek-chat",
     temperature=0.7,
     api_key=os.getenv("DEEPSEEK_API_KEY")
 )
 
-# ========== 2. 定义基础工具 ==========
+# ========== 3. 定义基础工具 ==========
 @tool
 def get_current_time() -> str:
-    """返回当前时间"""
+    """返回当前时间，当用户问现在几点了时使用此工具"""
     return f"当前时间是: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
 @tool
 def calculate(expression: str) -> str:
-    """计算数学表达式"""
+    """计算数学表达式，当用户需要计算时使用此工具
+    
+    参数:
+        expression: 数学表达式，如 '15 * 37 + 28'
+    """
     try:
         result = eval(expression, {"__builtins__": {}}, {})
         return f"计算结果: {result}"
@@ -34,141 +39,157 @@ def calculate(expression: str) -> str:
 
 @tool
 def search_web(query: str) -> str:
-    """执行在线搜索获取最新信息"""
+    """执行在线搜索获取最新信息。当用户询问新闻、时事、你不知道的知识时使用此工具。"""
     try:
         tavily = TavilySearchResults(
             api_key=os.getenv("TAVILY_API_KEY"),
-            max_results=2
+            max_results=3
         )
         result = tavily.invoke(query)
+        
+        # 清洗结果
         if isinstance(result, list):
             cleaned = []
-            for item in result:
+            for item in result[:2]:
                 title = item.get('title', '')
                 content = item.get('content', '')
                 if content:
-                    content = ' '.join(content.split())[:150]
+                    content = ' '.join(content.split())[:200]
                     cleaned.append(f"{title}: {content}")
             return "\n".join(cleaned)
         return str(result)
     except Exception as e:
         return f"搜索失败: {e}"
 
-# ========== 3. 创建专员Agent ==========
+# ========== 4. 创建专员 Agent ==========
 time_agent = create_agent(
     model=llm,
     tools=[get_current_time],
-    system_prompt="你是一个时间查询专员。用户问时间时，调用get_current_time。"
+    system_prompt="你是一个时间查询专员。用户问时间相关的问题时，调用 get_current_time 工具回答。"
 )
 
 calc_agent = create_agent(
     model=llm,
     tools=[calculate],
-    system_prompt="你是一个计算专员。用户需要计算时，调用calculate。"
+    system_prompt="你是一个数学计算专员。用户需要计算时，调用 calculate 工具回答。"
 )
 
 search_agent = create_agent(
     model=llm,
     tools=[search_web],
-    system_prompt="你是一个搜索专员。用户需要查询信息时，调用search_web。"
+    system_prompt="你是一个信息搜索专员。用户需要查询新闻、资讯、实时信息时，调用 search_web 工具回答。"
 )
 
-# ========== 4. 升级版主管：处理混合问题 ==========
-def supervisor_v2(query: str) -> str:
-    """主管：识别混合问题，分步处理"""
+print("✅ 专员 Agent 创建完成")
+
+# ========== 5. 把专员包装成工具（供主管调用） ==========
+@tool
+def call_time_agent(query: str) -> str:
+    """调用时间专员处理时间相关问题。当用户问时间、日期时使用此工具。
     
-    # 第一步：分析问题中包含哪些任务
-    analysis_prompt = f"""
-分析用户问题中包含哪些类型的需求，用逗号分隔返回：
+    参数:
+        query: 时间相关的子问题，如'现在几点了'、'今天几号'
+    """
+    result = time_agent.invoke({"messages": [HumanMessage(content=query)]})
+    return result["messages"][-1].content
 
-问题：{query}
-
-可选类型：
-- time：时间查询（几点了、日期等）
-- calc：数学计算（加减乘除、计算等）
-- search：信息搜索（新闻、查询、找资料等）
-
-示例1："现在几点了？帮我查新闻" → time,search
-示例2："计算15*37，顺便问时间" → calc,time
-示例3："今天有什么新闻" → search
-示例4："你好" → none
-
-只返回类型，不要其他文字：
-"""
+@tool
+def call_calc_agent(query: str) -> str:
+    """调用计算专员处理数学计算。当用户需要计算时使用此工具。
     
-    task_types = llm.invoke(analysis_prompt).content.strip().lower()
-    print(f"📋 识别到任务: {task_types}")
-    
-    # 第二步：如果没有任务，直接回答
-    if task_types == "none" or not task_types:
-        return llm.invoke(query).content
-    
-    # 第三步：拆分任务并执行
-    tasks = [t.strip() for t in task_types.split(',')]
-    results = {}
-    
-    # 定义任务执行函数
-    def execute_task(task_type, original_query):
-        """根据任务类型执行，提取相关部分"""
-        
-        # 提取该任务相关的子问题
-        extract_prompt = f"""
-从原问题中提取出{task_type}相关的部分：
-原问题：{original_query}
+    参数:
+        query: 计算相关的子问题，如'15*37+28'
+    """
+    result = calc_agent.invoke({"messages": [HumanMessage(content=query)]})
+    return result["messages"][-1].content
 
-如果是time：只保留时间相关的部分
-如果是calc：只保留计算相关的部分
-如果是search：只保留搜索相关的部分
-
-直接返回提取后的子问题：
-"""
-        sub_query = llm.invoke(extract_prompt).content.strip()
-        
-        # 交给对应专员
-        if task_type == "time":
-            result = time_agent.invoke({"messages": [HumanMessage(content=sub_query)]})
-            return result["messages"][-1].content
-        elif task_type == "calc":
-            result = calc_agent.invoke({"messages": [HumanMessage(content=sub_query)]})
-            return result["messages"][-1].content
-        elif task_type == "search":
-            result = search_agent.invoke({"messages": [HumanMessage(content=sub_query)]})
-            return result["messages"][-1].content
-        return ""
+@tool
+def call_search_agent(query: str) -> str:
+    """调用搜索专员处理信息查询。当用户需要新闻、实时信息时使用此工具。
     
-    # 执行所有任务
-    for task in tasks:
-        print(f"🔧 正在执行: {task}")
-        results[task] = execute_task(task, query)
+    参数:
+        query: 搜索相关的子问题，如'今天的AI新闻'
+    """
+    result = search_agent.invoke({"messages": [HumanMessage(content=query)]})
+    return result["messages"][-1].content
+
+# 主管可用的工具集
+supervisor_tools = [call_time_agent, call_calc_agent, call_search_agent]
+
+# ========== 6. 创建主管 Agent（带记忆） ==========
+memory = MemorySaver()
+
+supervisor = create_agent(
+    model=llm,
+    tools=supervisor_tools,
+    system_prompt="""你是一个任务分配主管。根据用户问题，判断需要调用哪个专员工具：
+
+可用的工具：
+- call_time_agent：处理时间查询、日期相关问题
+- call_calc_agent：处理数学计算、表达式
+- call_search_agent：处理信息搜索、新闻、实时信息
+
+规则：
+1. 如果用户问题包含多个任务，可以按顺序调用多个工具
+2. 每次调用工具时，传入该任务对应的子问题
+3. 如果用户不需要工具（如打招呼、闲聊），直接回答
+4. 调用完工具后，将结果整合成自然、连贯的回答
+
+示例：
+用户："现在几点了？顺便查一下今天的AI新闻"
+你应该：
+1. 调用 call_time_agent("现在几点了")
+2. 调用 call_search_agent("今天的AI新闻")
+3. 整合回答："现在是下午3:30。今天的AI新闻有：OpenAI发布新模型..."
+
+记住：你是一个主管，负责分配任务和整合结果，不是具体执行者。
+""",
+    checkpointer=memory  
+)
+
+print("✅ 主管 Agent 创建完成（带记忆功能）")
+
+# ========== 7. 调用函数 ==========
+def chat(query: str, session_id: str = "default") -> str:
+    """带记忆的多轮对话
     
-    # 第四步：汇总结果
-    summary_prompt = f"""
-用户原问题：{query}
-
-各任务执行结果：
-{chr(10).join([f'- {k}: {v}' for k, v in results.items()])}
-
-请将这些结果整合成一个完整、自然的回答：
-"""
+    Args:
+        query: 用户问题
+        session_id: 会话ID，相同ID会共享记忆
     
-    final_answer = llm.invoke(summary_prompt).content
-    return final_answer
-
-# ========== 5. 测试混合问题 ==========
-def test_mixed_queries():
-    test_cases = [
-        "现在几点了？顺便帮我查一下今天的AI新闻",
-        "计算 15*37+28，然后告诉我现在的时间",
-        "帮我搜索最近的科技新闻，再算一下 2的10次方",
-        "现在几点了？帮我查新闻，顺便算一下 123+456"
-    ]
+    Returns:
+        Agent 回答
+    """
+    config = {"configurable": {"thread_id": session_id}}
     
-    for query in test_cases:
-        print(f"\n{'='*60}")
-        print(f"用户: {query}")
-        print(f"{'='*60}")
-        
-        answer = supervisor_v2(query)
-        print(f"助手: {answer}")
+    result = supervisor.invoke(
+        {"messages": [HumanMessage(content=query)]},
+        config=config
+    )
+    
+    return result["messages"][-1].content
 
-test_mixed_queries()
+def chat_with_print(query: str, session_id: str = "default") -> str:
+    """带打印的对话函数（用于测试）"""
+    print(f"\n{'='*60}")
+    print(f"用户: {query}")
+    print(f"{'='*60}")
+    
+    answer = chat(query, session_id)
+    
+    print(f"\n🤖 助手: {answer}")
+    return answer
+
+# ========== 8. 测试 ==========
+if __name__ == "__main__":
+    # 测试单任务
+    print("=== 测试单任务 ===")
+    print(chat("现在几点了？", "test1"))
+    
+    print("\n=== 测试混合任务 ===")
+    print(chat("现在几点了？顺便查一下今天的AI新闻", "test2"))
+    
+    print("\n=== 测试记忆 ===")
+    chat_with_print("我叫小明", "user_123")
+    chat_with_print("我叫什么名字？", "user_123")  
+    chat_with_print("我叫什么名字？", "user_456")  
